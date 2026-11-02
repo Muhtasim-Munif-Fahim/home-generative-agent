@@ -6,6 +6,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 from aiohttp import FormData
 from homeassistant.config_entries import ConfigEntryState
@@ -14,6 +15,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.home_generative_agent.const import (
     DOMAIN,
+    HTTP_STATUS_BAD_GATEWAY,
     HTTP_STATUS_BAD_REQUEST,
     HTTP_STATUS_OK,
     HTTP_STATUS_REQUEST_TOO_LARGE,
@@ -446,3 +448,91 @@ async def test_enroll_too_many_files(
     assert response.status == HTTP_STATUS_REQUEST_TOO_LARGE
     assert "Too many files" in data["message"]
     assert dao.last_args is None, "enrollment ran despite the refused request"
+
+
+class _FaceServiceDownDAO(DummyDAO):
+    """A DAO whose face-service request fails the way an outage does."""
+
+    error: Exception | None = None
+
+    async def enroll_from_image(
+        self, face_api_url: str, name: str, image_bytes: bytes
+    ) -> bool:
+        """Fail the second image (if any) with the configured httpx error."""
+        if self.last_args is None and self.results is not None:
+            self.last_args = (face_api_url, name, image_bytes)
+            return True
+        assert self.error is not None
+        raise self.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            httpx.ConnectError("[Errno 111] Connection refused"),
+            "Could not reach the face service at http://face-api: [Errno 111]",
+        ),
+        (
+            httpx.ReadTimeout(""),
+            "Could not reach the face service at http://face-api: ReadTimeout",
+        ),
+        (
+            httpx.HTTPStatusError(
+                "boom",
+                request=httpx.Request("POST", "http://face-api/analyze"),
+                response=httpx.Response(500),
+            ),
+            "The face service at http://face-api returned HTTP 500",
+        ),
+    ],
+)
+async def test_enroll_names_the_face_service_when_it_fails(
+    hass: HomeAssistant,
+    hass_client: Callable[[], Awaitable[TestClient]],
+    error: Exception,
+    expected: str,
+) -> None:
+    """A face-service failure is a 502 naming the service, not "reloading" (#906)."""
+    await async_setup_component(hass, "http", {})
+    dao = _FaceServiceDownDAO()
+    dao.error = error
+    _add_loaded_entry(hass, dao)
+    hass.http.register_view(EnrollPersonView(hass))
+    client = await hass_client()
+
+    form = FormData()
+    form.add_field("name", "Alice")
+    form.add_field("file", b"img", filename="face.jpg", content_type="image/jpeg")
+
+    response = await client.post("/api/home_generative_agent/enroll", data=form)
+    data = await response.json()
+
+    assert response.status == HTTP_STATUS_BAD_GATEWAY
+    assert expected in data["message"]
+    assert "reloading" not in data["message"]
+
+
+@pytest.mark.asyncio
+async def test_enroll_face_service_failure_reports_partial_progress(
+    hass: HomeAssistant, hass_client: Callable[[], Awaitable[TestClient]]
+) -> None:
+    """Images enrolled before the face service failed are reported."""
+    await async_setup_component(hass, "http", {})
+    dao = _FaceServiceDownDAO(results=[])
+    dao.error = httpx.ConnectError("Connection refused")
+    _add_loaded_entry(hass, dao)
+    hass.http.register_view(EnrollPersonView(hass))
+    client = await hass_client()
+
+    form = FormData()
+    form.add_field("name", "Alice")
+    form.add_field("file", b"img1", filename="face1.jpg", content_type="image/jpeg")
+    form.add_field("file", b"img2", filename="face2.jpg", content_type="image/jpeg")
+
+    response = await client.post("/api/home_generative_agent/enroll", data=form)
+    data = await response.json()
+
+    assert response.status == HTTP_STATUS_BAD_GATEWAY
+    assert "Enrolled 1 image(s) before the failure" in data["message"]

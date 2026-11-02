@@ -30,6 +30,23 @@ def face_api_url(base_url: str, path: str) -> str:
     return urljoin(base_url.rstrip("/") + "/", path)
 
 
+def face_api_error_message(base_url: str, err: httpx.HTTPError) -> str:
+    """
+    Say that the face service failed, and how, for a user-facing error.
+
+    ``str()`` of an httpx timeout or connection error is often empty, so the
+    exception type stands in for it.
+    """
+    if isinstance(err, httpx.HTTPStatusError):
+        response = err.response
+        return (
+            f"The face service at {base_url} returned HTTP"
+            f" {response.status_code} {response.reason_phrase}".rstrip()
+        )
+    detail = str(err) or type(err).__name__
+    return f"Could not reach the face service at {base_url}: {detail}"
+
+
 async def face_api_request(
     send: Callable[[], Awaitable[httpx.Response]],
 ) -> httpx.Response:

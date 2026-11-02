@@ -310,6 +310,7 @@ from .core.embedding_store import (
     embedding_size_check_provider,
     missing_tables,
 )
+from .core.face_api import face_api_error_message
 from .core.face_guard import (
     async_check_unknown_person_rules,
     async_clear_unknown_person_issue,
@@ -4462,7 +4463,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: HGAConfigEntry) -> bool:
             msg = f"Could not read media: {err}"
             raise HomeAssistantError(msg) from err
 
-        ok = await dao.enroll_from_image(runtime_data.face_api_url, name, img_bytes)
+        try:
+            ok = await dao.enroll_from_image(runtime_data.face_api_url, name, img_bytes)
+        except httpx.HTTPError as err:
+            msg = face_api_error_message(runtime_data.face_api_url, err)
+            raise HomeAssistantError(msg) from err
+        except psycopg.Error as err:
+            msg = f"Could not save {name} to the person gallery database: {err}"
+            raise HomeAssistantError(msg) from err
         if not ok:
             msg = f"No face found in image for {name}"
             raise HomeAssistantError(msg)

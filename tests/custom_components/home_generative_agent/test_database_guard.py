@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, cast
 from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from homeassistant.config_entries import (
     SIGNAL_CONFIG_ENTRY_CHANGED,
@@ -1095,3 +1096,52 @@ async def test_other_schema_errors_keep_the_generic_failure(
     assert result is False
     assert "Postgresql setup failed" in caplog.text
     assert [pool.close_calls for pool in _TrackedPool.instances] == [1]
+
+
+class _RaisingGallery:
+    """A gallery whose enrollment raises the configured error."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def enroll_from_image(self, *_args: Any) -> bool:
+        raise self.error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "match"),
+    [
+        (
+            httpx.ConnectError("Connection refused"),
+            "Could not reach the face service at .*: Connection refused",
+        ),
+        (
+            httpx.RemoteProtocolError(""),
+            "Could not reach the face service at .*: RemoteProtocolError",
+        ),
+        (
+            OperationalError("connection is lost"),
+            "Could not save Alice to the person gallery database: connection",
+        ),
+    ],
+)
+async def test_enroll_person_service_names_face_service_and_database_errors(
+    hass: Any, monkeypatch: pytest.MonkeyPatch, error: Exception, match: str
+) -> None:
+    """Enrollment failures surface as a clear HomeAssistantError (#906)."""
+    entry = await _setup_without_database(hass, monkeypatch)
+    entry.runtime_data.person_gallery = cast("Any", _RaisingGallery(error))
+
+    async def _image(*_args: Any, **_kwargs: Any) -> bytes:
+        return b"img"
+
+    monkeypatch.setattr(hga_component, "_read_enroll_image_bytes", _image)
+
+    with pytest.raises(HomeAssistantError, match=match):
+        await hass.services.async_call(
+            DOMAIN,
+            "enroll_person",
+            {"name": "Alice", "file_path": "/media/faces/alice.jpg"},
+            blocking=True,
+        )

@@ -6,11 +6,18 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, cast
 
+import httpx
 from aiohttp import multipart, web
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.helpers.http import HomeAssistantView
 
-from .const import DOMAIN, NO_DATABASE_ENROLL_MESSAGE, NO_DATABASE_ERROR_CODE
+from .const import (
+    DOMAIN,
+    HTTP_STATUS_BAD_GATEWAY,
+    NO_DATABASE_ENROLL_MESSAGE,
+    NO_DATABASE_ERROR_CODE,
+)
+from .core.face_api import face_api_error_message
 
 if TYPE_CHECKING:
     from homeassistant.core import HomeAssistant
@@ -34,6 +41,25 @@ def _is_allowed_image(part: multipart.BodyPartReader) -> bool:
     if part.filename:
         return Path(part.filename).suffix.lower() in ALLOWED_EXTENSIONS
     return False
+
+
+def _face_service_error_response(
+    face_api_url: str, err: httpx.HTTPError, enrolled: int
+) -> web.Response:
+    """
+    Answer a face-service failure as a 502 naming the service (#906).
+
+    Kept apart from the teardown 503: the face service being down is fixed on
+    the face service, not by reloading Home Generative Agent.
+    """
+    LOGGER.warning("Enrollment failed: face service error: %r", err)
+    message = face_api_error_message(face_api_url, err)
+    if enrolled:
+        message += f" Enrolled {enrolled} image(s) before the failure."
+    return web.json_response(
+        {"status": "error", "message": message},
+        status=HTTP_STATUS_BAD_GATEWAY,
+    )
 
 
 class EnrollPersonView(HomeAssistantView):
@@ -179,6 +205,8 @@ class EnrollPersonView(HomeAssistantView):
                     skipped += 1
                     continue
                 enrolled += 1
+        except httpx.HTTPError as err:
+            return _face_service_error_response(face_api_url, err, enrolled)
         except Exception:
             # A mid-upload teardown closes the DAO's pool under this request.
             # Surface it as the same 503 as "not loaded" instead of letting
